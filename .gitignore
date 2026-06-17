@@ -1,0 +1,7 @@
+.env
+*.yaml
+__pycache__/
+*.pyc
+.feldera-skills/
+tests/
+*.code-workspace

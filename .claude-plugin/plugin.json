@@ -1,0 +1,13 @@
+{
+  "name": "feldera-skills",
+  "description": "Feldera skills for Claude Code: install and connect to Feldera, deploy pipelines from SQL, translate Spark SQL to Feldera SQL, and search Feldera docs.",
+  "version": "0.1.0",
+  "author": {
+    "name": "feldera",
+    "url": "https://github.com/feldera"
+  },
+  "repository": "https://github.com/feldera/feldera-skills",
+  "homepage": "https://feldera.com",
+  "license": "MIT",
+  "keywords": ["feldera", "streaming", "sql", "pipeline", "cdc", "materialized-view", "real-time", "spark", "migration"]
+}
