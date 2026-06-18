@@ -15,6 +15,8 @@ claude plugin marketplace add feldera/feldera-skills
 claude plugin install feldera-skills
 ```
 
+> **Note:** After installing or updating, you may need to reload the skills before they appear — run `/reload-skills`, or restart Claude Code (or start a new session). If a skill still doesn't show up or seems out of date, re-run the install command to refresh the marketplace cache.
+
 ## Skills
 
 | Skill | Description | Status |
