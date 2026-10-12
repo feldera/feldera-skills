@@ -26,6 +26,7 @@ claude plugin install feldera-skills
 | `deploy-pipeline` | Create or update a Feldera pipeline from a SQL file | ✅ |
 | `felderize` | Translate Spark SQL into valid Feldera SQL | ✅ |
 | `feldera-docs` | Search Feldera documentation | ✅ |
+| `support-bundle-triage` | Find why a pipeline crashed, is slow, uses too much memory, or is skewed, from a support bundle | ✅ |
 
 ## Usage
 
@@ -46,6 +47,8 @@ are read relative to your current directory):
 
 /feldera-skills:feldera-docs TUMBLE window function
 /feldera-skills:feldera-docs Kafka source connector
+
+/feldera-skills:support-bundle-triage <support-bundle-zip>
 ```
 
 ### `felderize` example
@@ -83,6 +86,7 @@ These skills follow the [Agent Skills Open Standard](https://agentskills.io) —
 | `deploy-pipeline` | shell + the `fda` CLI + a reachable Feldera instance |
 | `feldera-docs` | a **web-fetch** capability (reads docs.feldera.com) |
 | `install-fda`, `install-feldera` | shell + a **web-fetch** capability (read the docs / GitHub releases) |
+| `support-bundle-triage` | shell + Python 3 (standard library only) + `unzip` |
 
 In Claude Code you invoke a skill with its plugin namespace (`/feldera-skills:felderize …`); other agents invoke by skill name (`/felderize …`) or load it automatically when your prompt matches.
 
