@@ -27,8 +27,8 @@ already in the bundle:
 
 | Instead of a fixed limit on | Derive |
 | --- | --- |
-| filter bytes | filter bytes / `resources.memory_mb_max`, and bytes per filter hit |
-| step latency | latency vs `checkpoint_interval_secs`, and wall clock / step count |
+| filter bytes | filter bytes / `resources.memory_max`, and bytes per filter hit |
+| step latency | latency vs `checkpoint_interval`, and wall clock / step count |
 | skew ratio (max / mean) | `max - mean` in the metric's own units, ranked by excess |
 | state record count | share of that metric's grand total across all operators |
 | RSS | trend across snapshots, plus RSS / the controller's own `max_rss_bytes` |
@@ -56,7 +56,7 @@ A bundle holds several timestamped collection directories plus `metadata.txt`.
 Directory names are ISO timestamps, so they sort chronologically. Do not
 assume the oldest snapshot is healthy. Collection can start after the problem
 did, so every snapshot can show it. Test each snapshot against the pipeline's
-own budgets (`memory_mb_max`, `checkpoint_interval_secs`, `max_rss_bytes`)
+own budgets (`memory_max`, `checkpoint_interval`, `max_rss_bytes`)
 before you call it a baseline:
 
 | Snapshots show | Compare against | Reading |
@@ -75,13 +75,37 @@ Artifacts missing from the newest snapshot ("status is currently
 
 | File | Carries | Blind spot |
 | --- | --- | --- |
-| `pipeline_config.json` | status, `runtime_config` budgets, `program_code` (the SQL), K8s `restartCount` / `exitCode` / `OOMKilled` | none; read it first |
+| `pipeline_config.json` | status, budgets in `deployment_config` (the most recent run) and `runtime_config` (as saved), `program_code` (the SQL), K8s `restartCount` / `exitCode` / `OOMKilled` | `deployment_config` is null until the first start; read it first |
 | `metrics.txt` | Prometheus families, aggregate plus per-`endpoint` | no `worker` or `operator` label |
 | `circuit_profile.json` | per-worker, per-operator metrics in categories, plus its own metric catalog under `metrics` | large; only present while the pipeline is alive |
 | `heap_profile.pb.gz` | gzipped pprof from `jemalloc_pprof`; live allocation sites, symbolized | Linux only, and a build with heap profiling enabled; whole-process, never per worker |
 | `dataflow_graph.json` | `mir` nodes with `table` / `view` / `operation` / SQL `positions`, and `calcite_plan` | none |
 | `stats.json` | `rss_bytes`, `storage_bytes`, `memory_pressure`, input vs processed | absent once the pipeline is down |
 | `logs.txt` | connector errors, transaction progress | no exit code; lines are duplicated |
+
+Feldera 0.366.0 renamed the duration settings and 0.367.0 renamed the size
+settings. The unit moved from the name into the value:
+
+| Before | After |
+| --- | --- |
+| `fault_tolerance.checkpoint_interval_secs: 60` | `fault_tolerance.checkpoint_interval: "1m"` |
+| `resources.memory_mb_max: 16000` (MB) | `resources.memory_max: "16G"` |
+| `resources.storage_mb_max`, `max_rss_mb`, `datafusion_memory_mb` (MB) | `storage_max`, `max_rss`, `datafusion_memory` |
+| `storage.min_storage_bytes`, `storage.cache_mib` | `storage.min_spill_size`, `storage.cache_size` |
+
+A config not saved since the upgrade keeps the old names, so a bundle can
+carry either. The probe reads both and prints each key as the config spells
+it. Use that spelling when you name a key to the user.
+
+The probe reads each budget from `deployment_config` first, because that is
+what ran. `runtime_config` can differ from it: a live resize changes only
+`deployment_config`, and an edit made while the pipeline is stopped changes
+`runtime_config` before the next run. When the two differ, the `state`
+section prints each gap with the value that ran, the value saved, and the
+cause: live resize or edit not run yet. An edit not run yet can be a fix that
+the user already saved, so read it before you recommend a change. The
+`memory` and `pace` sections take the config from the snapshot that their
+profile or metrics came from, not from the newest snapshot.
 
 ## Problem class to signal
 
@@ -95,7 +119,7 @@ hardcoded list.
 | crash, restart loop | `state` | `exitCode` 137 + `OOMKilled` in `lastState`, `restartCount` per snapshot |
 | pipeline is slow | `pace`, `time` | mode first, then `runtime_seconds` share per operator, `exchange_wait_time_seconds` |
 | skewed join or shard | `skew` | `key_distribution` excess, per-worker spread of `local_shard_records_count` |
-| memory pressure | `memory`, `heap`, `trend` | share of `memory_mb_max`; filter bytes per hit; bits-per-key overhead; `loose_memory` vs `loose_storage` |
+| memory pressure | `memory`, `heap`, `trend` | share of `memory_max`; filter bytes per hit; bits-per-key overhead; `loose_memory` vs `loose_storage` |
 | where memory actually went | `heap` | allocation site shares from `heap_profile.pb.gz`, and its agreement with the circuit profile |
 | slow disk | `disk` | `storage_*_latency_seconds` percentiles, cache saturation, `compaction_stall_duration_seconds` |
 | inefficient SQL | `sql`, `time` | join amplification, `output_redundancy_percent`, `negative_weight_count`, state with no `retainment_bounds` |
@@ -166,7 +190,8 @@ The `memory` section of the probe uses this maths:
 - `bits per key overhead = reported / configured`. At 1.5 or above, the filters
   are bigger than the rate implies because `fastbloom` floors every filter at
   512 bits, so batches too small to need one still pay. The knob is
-  `min_storage_bytes`, not the false-positive rate. Getting this backwards is
+  `min_spill_size` (`min_storage_bytes` before 0.367.0), not the
+  false-positive rate. Getting this backwards is
   the common mistake.
 - Heap bloom bytes are the headline figure and circuit filter metrics the
   fallback; their ratio should sit slightly above 1. Far outside roughly

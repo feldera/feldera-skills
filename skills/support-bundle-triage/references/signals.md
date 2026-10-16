@@ -48,7 +48,7 @@ latency describes nothing.
 | seconds per circuit step | wall clock / circuit steps |
 | operator share of runtime | node `runtime_seconds` sum / grand total |
 | blocked on exchange | `exchange_wait_time_seconds` sum / `circuit_runtime_seconds` sum |
-| checkpoint keeping up | mean `feldera_checkpoint_runtime_seconds` vs `checkpoint_interval_secs` |
+| checkpoint keeping up | mean `feldera_checkpoint_runtime_seconds` vs `checkpoint_interval` (`checkpoint_interval_secs` before 0.366.0) |
 | ingest keeping up | `total_input_records - total_processed_records`, as a share of input |
 
 Related: `circuit_idle_time_seconds`, `circuit_wait_time_seconds`,
@@ -79,9 +79,11 @@ read the key expression.
 
 ### Memory pressure
 
-Denominators: `resources.memory_mb_max`, `resources.storage_mb_max`,
+Denominators: `resources.memory_max`, `resources.storage_max`,
 `max_rss_bytes` (what the controller actually budgeted), and
-`datafusion_memory_mb` for connector-side sorts.
+`datafusion_memory` for connector-side sorts. Before 0.367.0 the config
+names were `memory_mb_max`, `storage_mb_max` and `datafusion_memory_mb`, with
+values in MB. The Prometheus gauge `max_rss_bytes` did not change.
 
 | Quantity | Formula |
 | --- | --- |
@@ -96,7 +98,7 @@ A filter that is large and rarely hits is pure waste; neither a size
 threshold nor a hit-rate threshold finds it alone. Charge on-disk metrics to
 the storage budget, or they manufacture readings above 100%.
 
-When `max_rss_mb` is unset the controller derives its budget from the pod
+When `max_rss` (`max_rss_mb` before 0.367.0) is unset the controller derives its budget from the pod
 limit, which can leave little headroom. A single large
 untracked allocation then kills the pod.
 
