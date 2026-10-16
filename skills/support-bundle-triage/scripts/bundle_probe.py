@@ -59,6 +59,286 @@ def fmt_bytes(n):
     return f"{n:.1f}PB"
 
 
+# --------------------------------------------------------------------------
+# config settings -- read under either name, the way Feldera reads them
+# --------------------------------------------------------------------------
+# Feldera 0.366.0 moved the unit of each duration setting from its name into
+# its value (checkpoint_interval_secs: 60 -> checkpoint_interval: "1m"), and
+# 0.367.0 did the same for sizes (memory_mb_max: 16000 -> memory_max: "16G").
+# A config saved since then carries only the new names; one saved before, only
+# the old ones. The value type picks the parser, not the name: a string
+# carries its unit, a bare number counts the unit of the old name.
+Setting = collections.namedtuple("Setting", "section current legacy unit kind")
+Found = collections.namedtuple("Found", "key written value current")
+
+MB = 1_000_000  # memory_mb_* is decimal: 128000 exports max_rss_bytes=125952000000
+MAX_RSS = Setting(None, "max_rss", "max_rss_mb", MB, "size")
+DATAFUSION_MEMORY = Setting(None, "datafusion_memory", "datafusion_memory_mb", MB, "size")
+MEMORY_MIN = Setting("resources", "memory_min", "memory_mb_min", MB, "size")
+MEMORY_MAX = Setting("resources", "memory_max", "memory_mb_max", MB, "size")
+STORAGE_MIN = Setting("resources", "storage_min", "storage_mb_min", MB, "size")
+STORAGE_MAX = Setting("resources", "storage_max", "storage_mb_max", MB, "size")
+CACHE_SIZE = Setting("storage", "cache_size", "cache_mib", 1 << 20, "size")
+MIN_SPILL_SIZE = Setting("storage", "min_spill_size", "min_storage_bytes", 1, "size")
+MIN_STEP_SPILL_SIZE = Setting("storage", "min_step_spill_size", "min_step_storage_bytes",
+                              1, "size")
+SIZE_SETTINGS = (MAX_RSS, DATAFUSION_MEMORY, MEMORY_MIN, MEMORY_MAX, STORAGE_MIN,
+                 STORAGE_MAX, CACHE_SIZE, MIN_SPILL_SIZE, MIN_STEP_SPILL_SIZE)
+SIZE_RENAME_VERSION = (0, 367, 0)
+CHECKPOINT_INTERVAL = Setting("fault_tolerance", "checkpoint_interval",
+                              "checkpoint_interval_secs", 1, "duration")
+
+U64_MAX = (1 << 64) - 1
+DIGITS = frozenset("0123456789")  # ASCII only, as Rust's is_ascii_digit
+SIZE_UNITS = {"Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40,
+              "Pi": 1 << 50, "Ei": 1 << 60, "k": 10**3, "K": 10**3, "M": 10**6,
+              "G": 10**9, "T": 10**12, "P": 10**15, "E": 10**18}
+DURATION_NANOS = {"ns": 1, "us": 10**3, "µs": 10**3, "μs": 10**3,
+                  "ms": 10**6, "s": 10**9, "m": 60 * 10**9, "h": 3600 * 10**9,
+                  "d": 86400 * 10**9}
+
+
+def scan_number(text, at):
+    """-> (whole, fraction, end): digits, then at most one point and digits."""
+    end = at
+    while end < len(text) and text[end] in DIGITS:
+        end += 1
+    whole, fraction = text[at:end], ""
+    if end < len(text) and text[end] == ".":
+        start = end = end + 1
+        while end < len(text) and text[end] in DIGITS:
+            end += 1
+        fraction = text[start:end]
+    return whole, fraction, end
+
+
+def scaled(whole, fraction, unit):
+    """whole.fraction * unit, exact, to the nearest integer (halves up), or None."""
+    whole = whole.lstrip("0")
+    if len(whole) > 40:  # overflows any unit; int() also refuses huge strings
+        return None
+    total = int(whole or "0") * unit
+    if fraction:
+        kept = fraction[:18]
+        den = 10 ** len(kept)
+        total += (unit * int(kept) + den // 2) // den
+    return total
+
+
+def parse_size(text):
+    """Bytes in a quantity such as "16G" or "1.5Gi", as Feldera's size.rs, or None."""
+    if text.startswith("-"):
+        return None
+    body = text[1:] if text.startswith("+") else text
+    whole, fraction, end = scan_number(body, 0)
+    name = body[end:].removesuffix("B")
+    unit = SIZE_UNITS.get(name) if name else 1
+    if not (whole or fraction) or unit is None:
+        return None
+    total = scaled(whole, fraction, unit)
+    return total if total is not None and total <= U64_MAX else None
+
+
+def parse_duration(text):
+    """Nanoseconds in a duration such as "30s" or "1h30m", as Feldera's duration.rs, or None."""
+    if text.startswith("-"):
+        return None
+    body = text[1:] if text.startswith("+") else text
+    if body == "0":
+        return 0  # the one value with no unit
+    if not body:
+        return None
+    total = at = 0
+    while at < len(body):
+        whole, fraction, at = scan_number(body, at)
+        start = at
+        while at < len(body) and body[at] not in DIGITS and body[at] != ".":
+            at += 1
+        unit = DURATION_NANOS.get(body[start:at])
+        if not (whole or fraction) or unit is None:
+            return None
+        term = scaled(whole, fraction, unit)
+        if term is None:
+            return None
+        total += term
+    return total if total // 10**9 <= U64_MAX else None
+
+
+def whole_number(value):
+    """A bare JSON number as Feldera reads it: whole, 0 to 2^64 - 1, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (math.isfinite(value) and value >= 0 and value.is_integer()
+                and value < 2.0**64):
+            return None
+        value = int(value)
+    return value if isinstance(value, int) and 0 <= value <= U64_MAX else None
+
+
+def setting_value(raw, setting):
+    """Bytes for a size, seconds for a duration, or None where Feldera refuses raw."""
+    if isinstance(raw, str):
+        if setting.kind == "duration":
+            nanos = parse_duration(raw)
+            return None if nanos is None else nanos / 1e9
+        # "16000" would mean bytes where 16000 means MB, so Feldera refuses it
+        digits = raw.removeprefix("+")
+        if (setting.unit != 1 and any(c in DIGITS for c in digits)
+                and all(c in DIGITS or c == "." for c in digits) and digits.count(".") <= 1):
+            return None
+        return parse_size(raw)
+    n = whole_number(raw)
+    if n is None:
+        return None
+    return min(n * setting.unit, U64_MAX) if setting.kind == "size" else n * setting.unit
+
+
+def config_layers(cfg):
+    """-> [deployment_config, runtime_config], the ones present, in read order.
+
+    deployment_config is what the current or most recent run used, after any
+    live resize; it is null until the first start. runtime_config is what the
+    user saved, which can be an edit that has not run yet.
+    """
+    cfg = cfg or {}
+    return [layer for layer in (cfg.get("deployment_config"), cfg.get("runtime_config"))
+            if isinstance(layer, dict)]
+
+
+def layer_node(layer, section):
+    node = layer if section is None else layer.get(section)
+    return node if isinstance(node, dict) else None
+
+
+def lookup(layers, section, key):
+    """The value of key in the first layer that has it, or None.
+
+    A layer that has the key decides, even when it is null: deployment_config
+    writes every field, so null there means unset for that run.
+    """
+    for layer in layers:
+        node = layer_node(layer, section)
+        if node is not None and key in node:
+            return node[key]
+    return None
+
+
+def read_setting(layers, setting):
+    """-> Found from the first layer that has either name, or None when unset.
+
+    In one layer the current name wins over the old one; Feldera refuses a
+    config with both.
+    """
+    for layer in layers:
+        node = layer_node(layer, setting.section)
+        if node is None or (setting.current not in node and setting.legacy not in node):
+            continue
+        for key, current in ((setting.current, True), (setting.legacy, False)):
+            raw = node.get(key)
+            if raw is not None:
+                return Found(key, raw, setting_value(raw, setting), current)
+        return None
+    return None
+
+
+def describe(found, setting):
+    """The value as written, then what Feldera reads it as."""
+    if found is None:
+        return "unset"
+    written = json.dumps(found.written)
+    if found.value is None:
+        return f"{written} (Feldera refuses this value)"
+    if setting.kind == "duration":
+        return f"{written} ({found.value:g}s)"
+    return f"{written} ({fmt_bytes(found.value)})"
+
+
+def size_key(cfg, setting):
+    """The name of a size setting as this pipeline spells it.
+
+    The name it sets; else the spelling of the size keys in the first layer
+    that has any (null ones count); else the spelling its platform version reads.
+    """
+    layers = config_layers(cfg)
+    found = read_setting(layers, setting)
+    if found:
+        return found.key
+    for layer in layers:
+        nodes = [layer_node(layer, s.section) or {} for s in SIZE_SETTINGS]
+        if any(s.current in n for s, n in zip(SIZE_SETTINGS, nodes)):
+            return setting.current
+        if any(s.legacy in n for s, n in zip(SIZE_SETTINGS, nodes)):
+            return setting.legacy
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str((cfg or {}).get("platform_version") or ""))
+    current = bool(m) and tuple(map(int, m.groups())) >= SIZE_RENAME_VERSION
+    return setting.current if current else setting.legacy
+
+
+def snapshot_config(root, snap):
+    """-> (snapshot, config): the config collected with snap, else the newest one.
+
+    Budgets must come from the run that the profile or metrics describe; a
+    later snapshot can hold an edited config or a different run.
+    """
+    if snap:
+        cfg = load_json(os.path.join(snap, "pipeline_config.json"))
+        if cfg:
+            return snap, cfg
+    for s in reversed(snapshots(root)):
+        cfg = load_json(os.path.join(s, "pipeline_config.json"))
+        if cfg:
+            return s, cfg
+    return None, None
+
+
+# Budget fields compared between the two layers. A live resize (Enterprise,
+# 0.365.0+) changes only CPU and memory in deployment_config, and an edit of
+# CPU or memory overwrites it there, so a CPU or memory gap is a resize. Any
+# other gap is an edit saved while stopped, which applies at the next start.
+DRIFT_FIELDS = ((None, "workers"), (None, "io_workers"), ("resources", "cpu_cores_min"),
+                ("resources", "cpu_cores_max"), ("resources", "storage_class"),
+                ("fault_tolerance", "model"))
+DRIFT_SETTINGS = (MEMORY_MIN, MEMORY_MAX, MAX_RSS, DATAFUSION_MEMORY, STORAGE_MAX,
+                  MIN_SPILL_SIZE, CHECKPOINT_INTERVAL)
+LIVE_RESIZE = {"cpu_cores_min", "cpu_cores_max", MEMORY_MIN.current, MEMORY_MAX.current}
+
+
+def config_drift(cfg):
+    """-> [(name, ran, saved, live resize?)] where runtime_config differs from deployment_config.
+
+    Only keys that runtime_config sets are compared: deployment_config fills
+    every other one with its default. Sizes and durations compare as bytes and
+    seconds, so a respelling after the 0.366.0 or 0.367.0 rename is no gap.
+    """
+    cfg = cfg or {}
+    dc, rc = cfg.get("deployment_config"), cfg.get("runtime_config")
+    if not (isinstance(dc, dict) and isinstance(rc, dict)):
+        return []
+    rows = []
+    for section, key in DRIFT_FIELDS:
+        node = layer_node(rc, section)
+        if node is None or key not in node:
+            continue
+        ran = lookup([dc], section, key)
+        if ran != node[key]:
+            rows.append((key, json.dumps(ran), json.dumps(node[key]), key in LIVE_RESIZE))
+
+    def value(found):
+        if found is None:
+            return None
+        return found.value if found.value is not None else ("refused", json.dumps(found.written))
+    for s in DRIFT_SETTINGS:
+        node = layer_node(rc, s.section)
+        if node is None or (s.current not in node and s.legacy not in node):
+            continue
+        ran, saved = read_setting([dc], s), read_setting([rc], s)
+        if value(ran) != value(saved):
+            name = (saved or ran).key if (saved or ran) else s.current
+            rows.append((name, describe(ran, s), describe(saved, s), s.current in LIVE_RESIZE))
+    return rows
+
+
 # Measurement envelope variants seen in circuit_profile.json. Any type missing
 # from this map yields None, which a caller that sums silently reports as 0 --
 # a wrong answer that looks like a healthy one. Keep this list exhaustive:
@@ -141,24 +421,40 @@ def section_state(root):
     if det:
         print(f"  status details    {json.dumps(det)[:300]}")
 
-    rc = cfg.get("runtime_config") or {}
-    res = rc.get("resources") or {}
-    workers = rc.get("workers")
-    mem_max = res.get("memory_mb_max")
+    layers = config_layers(cfg)
+    mem_max = read_setting(layers, MEMORY_MAX)
     print("  -- budget (denominators for every memory rule below) --")
-    print(f"  workers           {workers}   io_workers {rc.get('io_workers')}")
-    print(f"  memory_mb_max     {mem_max}   max_rss_mb {rc.get('max_rss_mb')}")
-    print(f"  datafusion_mb     {rc.get('datafusion_memory_mb')}")
-    print(f"  storage_mb_max    {res.get('storage_mb_max')}   class {res.get('storage_class')}")
-    ft = rc.get("fault_tolerance") or {}
-    ci_secs = ft.get("checkpoint_interval_secs")
-    print(f"  fault_tolerance   {ft.get('model') or '-'}"
-          + (f" every {ci_secs}s" if ci_secs else " (no checkpoint interval set)"))
-    print(f"  env               {rc.get('env')}")
+    print(f"  {'source':<20} "
+          + ("deployment_config (the most recent run)"
+             if isinstance(cfg.get("deployment_config"), dict)
+             else "runtime_config (never started)"))
+    print(f"  {'workers':<20} {lookup(layers, None, 'workers')}"
+          f"   io_workers {lookup(layers, None, 'io_workers')}")
+    # each key as this pipeline spells it, value as written (what Feldera reads)
+    for s in (MEMORY_MAX, MAX_RSS, DATAFUSION_MEMORY, STORAGE_MAX):
+        print(f"  {size_key(cfg, s):<20} {describe(read_setting(layers, s), s)}")
+    print(f"  {'storage_class':<20} {lookup(layers, 'resources', 'storage_class')}")
+    ci = read_setting(layers, CHECKPOINT_INTERVAL)
+    print(f"  {'fault_tolerance':<20} {lookup(layers, 'fault_tolerance', 'model') or '-'}, "
+          + (f"{ci.key} {describe(ci, CHECKPOINT_INTERVAL)}" if ci
+             else "no checkpoint interval set"))
+    print(f"  {'env':<20} {lookup(layers, None, 'env')}")
 
-    if rc.get("max_rss_mb") is None and mem_max:
-        print(f"  NOTE max_rss_mb unset; controller derives its budget from the pod limit,"
-              f" often leaving little headroom under {mem_max} MB")
+    drift = config_drift(cfg)
+    if drift:
+        print("  -- runtime_config differs from what ran --")
+        print(f"  {'setting':<20} {'ran':<24} {'saved':<24} why")
+        for name, ran, saved, live in drift:
+            print(f"  {name:<20} {ran:<24} {saved:<24} "
+                  + ("live resize" if live else "edit not run yet"))
+        if any(live for *_, live in drift):
+            print("  live resize: kept until storage is cleared or CPU or memory is edited")
+        if not all(live for *_, live in drift):
+            print("  edit not run yet: saved while stopped, applies at the next start")
+
+    if read_setting(layers, MAX_RSS) is None and mem_max and mem_max.value:
+        print(f"  NOTE {size_key(cfg, MAX_RSS)} unset; controller derives its budget from"
+              f" the pod limit, often leaving little headroom under {fmt_bytes(mem_max.value)}")
 
     # container restarts and OOM live only here, never in logs.txt
     blob = json.dumps(cfg.get("deployment_resources_status_details"))
@@ -604,24 +900,25 @@ def find_config_value(doc, key):
 
 def section_memory(root, top):
     snap, prof = newest_profile(root)
-    snaps = snapshots(root)
-    cfg = load_json(os.path.join(snaps[-1], "pipeline_config.json")) if snaps else None
-    budget_mb = None
-    if cfg:
-        budget_mb = ((cfg.get("runtime_config") or {}).get("resources") or {}).get("memory_mb_max")
-    budget = budget_mb * 1_000_000 if budget_mb else None
+    cfg_snap, cfg = snapshot_config(root, snap)
+    layers = config_layers(cfg)
+    mem, disk = read_setting(layers, MEMORY_MAX), read_setting(layers, STORAGE_MAX)
+    budget = mem.value if mem else None
     print("== memory, as a share of the pipeline's own budget ==")
-    print(f"  budget memory_mb_max = {budget_mb} MB"
-          if budget_mb else "  budget unknown; shares cannot be computed")
+    if snap and cfg_snap != snap:
+        print(f"  NOTE {os.path.basename(snap)} has no pipeline_config.json; budget is from"
+              f" {os.path.basename(cfg_snap) if cfg_snap else 'nowhere'}, maybe another run")
+    print(f"  budget {mem.key} = {describe(mem, MEMORY_MAX)}" if budget
+          else "  budget unknown; shares cannot be computed"
+          + (f": {mem.key} {describe(mem, MEMORY_MAX)}" if mem else ""))
     if not prof:
         print("  no circuit_profile.json[.gz] in any snapshot")
         return
 
-    store_mb = None
-    if cfg:
-        store_mb = ((cfg.get("runtime_config") or {}).get("resources") or {}).get("storage_mb_max")
-    store = store_mb * 1_000_000 if store_mb else None
-    print(f"  budget storage_mb_max = {store_mb} MB" if store_mb else "  storage budget unknown")
+    store = disk.value if disk else None
+    print(f"  budget {disk.key} = {describe(disk, STORAGE_MAX)}" if store
+          else "  storage budget unknown"
+          + (f": {disk.key} {describe(disk, STORAGE_MAX)}" if disk else ""))
 
     def share(n, against="mem"):
         b = budget if against == "mem" else store
@@ -681,8 +978,10 @@ def section_memory(root, top):
 
     # Filter sizing: are the filters bigger than the configured rate implies?
     rate = None
-    if cfg:
-        rate = find_config_value(cfg, "bloom_false_positive_rate")
+    for doc in layers + [cfg]:
+        rate = find_config_value(doc, "bloom_false_positive_rate")
+        if rate is not None:
+            break
     rate_is_default = rate is None
     if rate is None:
         rate = DEFAULT_BLOOM_FALSE_POSITIVE_RATE
@@ -713,7 +1012,8 @@ def section_memory(root, top):
         if overhead >= 1.5:
             print("     >> filters cost far more per key than the rate implies. fastbloom")
             print("        floors every filter at 512 bits, so batches too small to need one")
-            print("        still pay. Raise min_storage_bytes; relaxing the rate will not help.")
+            print(f"        still pay. Raise {size_key(cfg, MIN_SPILL_SIZE)};"
+                  " relaxing the rate will not help.")
         else:
             print("        Filters are sized as configured; their cost is key volume, not")
             print("        per-key overhead. Relaxing the rate is the lever that works here.")
@@ -996,24 +1296,22 @@ def section_pace(root):
     if g.get("records_late_total"):
         print(f"  records_late_total        {g['records_late_total']:,.0f}"
               " (arriving behind LATENESS: dropped from results)")
-    ci = None
-    cfg = None
-    for s in reversed(snapshots(root)):
-        cfg = load_json(os.path.join(s, "pipeline_config.json"))
-        if cfg:
-            break
-    if cfg:
-        ci = ((cfg.get("runtime_config") or {}).get("fault_tolerance") or {}) \
-            .get("checkpoint_interval_secs")
+    # the interval of the run these metrics came from
+    cfg_snap, cfg = snapshot_config(root, snap)
+    if cfg_snap and cfg_snap != snap:
+        print(f"  NOTE {os.path.basename(snap)} has no pipeline_config.json; interval is from"
+              f" {os.path.basename(cfg_snap)}, maybe another run")
+    found = read_setting(config_layers(cfg), CHECKPOINT_INTERVAL)
+    ci = found.value if found else None  # seconds
     if ci:
-        print(f"  checkpoint_interval_secs  {ci} "
-              "(the pipeline's own target cadence: compare step/commit time to this)")
+        print(f"  {found.key:<25} {describe(found, CHECKPOINT_INTERVAL)}: "
+              "the pipeline's own target cadence; compare step/commit time to this")
         c, s = tot.get("feldera_checkpoint_runtime_seconds", (0.0, 0.0))
         if c and s / c > ci:
-            print(f"  >> mean checkpoint runtime ({s/c:,.1f}s) exceeds the interval ({ci}s):"
+            print(f"  >> mean checkpoint runtime ({s/c:,.1f}s) exceeds the interval ({ci:g}s):"
                   " checkpoints cannot keep their schedule")
         if wall and steps and wall > ci and steps <= 1:
-            print(f"  >> the open transaction has run {wall:,.0f}s against a {ci}s checkpoint"
+            print(f"  >> the open transaction has run {wall:,.0f}s against a {ci:g}s checkpoint"
                   " interval: no checkpoint can complete until it commits")
 
 
