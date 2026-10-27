@@ -126,7 +126,7 @@ rate means the volume of I/O is the problem, not the device. Say which.
 | join amplification | `computed_output_records_count` / (`left_input_records_count` + `right_input_integral_records_count`) |
 | wasted downstream work | `output_redundancy_percent` |
 | retraction churn | `negative_weight_count` |
-| unbounded state | large `state_records_count` on nodes with no `retainment_bounds`; candidates for `LATENESS` or a window |
+| unbounded state | large `state_records_count` on nodes with no `retainment_bounds`, or a `None` bound (no waterline yet); candidates for `LATENESS` or a window |
 | dropped input | `records_late_total` |
 | batch shape | `input_batches_stats` / `output_batches_stats` min, max, avg, total |
 

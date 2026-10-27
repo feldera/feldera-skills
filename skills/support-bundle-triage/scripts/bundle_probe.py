@@ -8,10 +8,12 @@ thresholds are baked in: the caller judges the values in context.
 Usage:
     bundle_probe.py <extracted-bundle-dir> [--section SECTION] [--top N]
 
-Sections: state, errors, trend, time, skew, sql, memory, disk, all
+Sections: state, sidecars, errors, inputs, trend, pace, time, skew, sql,
+materialized, memory, heap, disk, types, all
 """
 import argparse
 import collections
+import functools
 import glob
 import gzip
 import json
@@ -21,11 +23,21 @@ import re
 import sys
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# "2026-06-09T17-38-34.679715382Z", "2026-08-27T02:17:02"; not "<timestamp>_x.zip"
+SNAPSHOT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.+\-Z]+$")
 
 
 def snapshots(root):
-    """Collection directories, oldest first. Names are ISO timestamps."""
-    dirs = [d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)]
+    """Collection directories, oldest first. Names are ISO timestamps.
+
+    A bundle zipped again holds them one directory down, so a single
+    wrapper directory is opened.
+    """
+    subdirs = [d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)]
+    dirs = [d for d in subdirs if SNAPSHOT_NAME.match(os.path.basename(d))]
+    wrappers = [d for d in subdirs if os.path.basename(d) != "__MACOSX"]
+    if not dirs and len(wrappers) == 1:
+        return snapshots(wrappers[0])
     return sorted(dirs, key=os.path.basename)
 
 
@@ -40,8 +52,12 @@ def artifact_path(path):
 def load_json(path):
     # bundles may ship any JSON artifact gzipped (circuit_profile.json.gz)
     path = artifact_path(path)
-    if not path:
-        return None
+    return read_json(os.path.abspath(path)) if path else None
+
+
+@functools.lru_cache(maxsize=None)
+def read_json(path):
+    """Parsed once per run: every section reads the same profile and configs."""
     opener = gzip.open if path.endswith(".gz") else open
     try:
         with opener(path, "rt") as f:
@@ -270,9 +286,15 @@ def size_key(cfg, setting):
             return setting.current
         if any(s.legacy in n for s, n in zip(SIZE_SETTINGS, nodes)):
             return setting.legacy
-    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str((cfg or {}).get("platform_version") or ""))
-    current = bool(m) and tuple(map(int, m.groups())) >= SIZE_RENAME_VERSION
+    version = version_tuple(cfg)
+    current = bool(version) and version >= SIZE_RENAME_VERSION
     return setting.current if current else setting.legacy
+
+
+def version_tuple(cfg):
+    """(major, minor, patch) of the config's platform_version, or None."""
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str((cfg or {}).get("platform_version") or ""))
+    return tuple(map(int, m.groups())) if m else None
 
 
 def snapshot_config(root, snap):
@@ -457,12 +479,17 @@ def section_state(root):
               f" the pod limit, often leaving little headroom under {fmt_bytes(mem_max.value)}")
 
     # container restarts and OOM live only here, never in logs.txt
-    blob = json.dumps(cfg.get("deployment_resources_status_details"))
-    for key in ("restartCount", "exitCode", "reason", "finishedAt"):
-        m = re.search(r'"%s":\s*("?[^,"}]*"?)' % key, blob)
-        if m:
-            print(f"  {key:<17} {m.group(1)}")
-    if '"OOMKilled"' in blob:
+    details = cfg.get("deployment_resources_status_details")
+    found = pod_containers(details)
+    pods = len({o for o, _, _ in found})
+    for ordinal, name, c in found:
+        t = last_termination(c)
+        w = ((c.get("state") or {}).get("waiting") or {}).get("reason")
+        print(f"  {container_who(ordinal, name, pods):<17} restartCount {c.get('restartCount', '?')}"
+              + (f", waiting {w}" if w else "")
+              + (f", last terminated {t.get('reason')} (exit {t.get('exitCode')})"
+                 f" at {t.get('finishedAt')}" if t else ""))
+    if '"OOMKilled"' in json.dumps(details):
         print("  >> OOMKilled present: treat memory as a primary suspect")
 
     ckpt = cfg.get("storage_status_details") or {}
@@ -470,14 +497,18 @@ def section_state(root):
         print("  >> no checkpoints recorded: a restart replays the full snapshot")
 
     # per-snapshot restartCount pins when the first crash happened
-    print("  -- restartCount by snapshot --")
+    print("  -- restartCount by snapshot (main per pod, other containers when > 0) --")
     for s in snaps:
         c = load_json(os.path.join(s, "pipeline_config.json"))
         if not c:
             continue
-        b = json.dumps(c.get("deployment_resources_status_details"))
-        m = re.search(r'"restartCount":\s*(\d+)', b)
-        print(f"    {os.path.basename(s):<34} {m.group(1) if m else '?'}")
+        found = pod_containers(c.get("deployment_resources_status_details"))
+        pods = len({o for o, _, _ in found})
+        counts = [(container_who(o, name, pods), x.get("restartCount", "?"))
+                  for o, name, x in found if name == "main" or x.get("restartCount")]
+        shown = (str(counts[0][1]) if len(counts) == 1 and counts[0][0] == "main"
+                 else ", ".join(f"{who} {n}" for who, n in counts) or "?")
+        print(f"    {os.path.basename(s):<34} {shown}")
 
 
 # --------------------------------------------------------------------------
@@ -512,6 +543,404 @@ def section_errors(root, top):
             att = [int(a) for a, _, _ in delays]
             print(f"     retry attempts seen: max={max(att)} distinct={len(set(att))}"
                   f" -> {'saturated, deterministic failure' if max(att) > 8 else 'still backing off'}")
+
+
+def pipeline_events(root):
+    """The runner's per-minute status events, oldest first, deduped by event_id.
+
+    Each snapshot carries the events of the window before it, so windows
+    overlap; the union spans more time than any one snapshot.
+    """
+    events = {}
+    for s in snapshots(root):
+        for e in load_json(os.path.join(s, "pipeline_events.json")) or []:
+            if isinstance(e, dict) and e.get("event_id"):
+                events[e["event_id"]] = e
+    return sorted(events.values(), key=lambda e: str(e.get("recorded_at")))
+
+
+# --------------------------------------------------------------------------
+# section: sidecars -- what ran in the pod, from the runner's status history
+# --------------------------------------------------------------------------
+# "[2026-10-22T10:01:27Z] (<pod uid>) Normal :: Killing (kubelet): Stopping container x (#1)"
+POD_EVENT = re.compile(r"^\[(?P<time>[^\]]+)\] \((?P<uid>[^)]*)\) (?P<type>\w+) :: "
+                       r"(?P<reason>\w+) \((?P<source>[^)]*)\): (?P<message>.*?)(?: \(#\d+\))?$")
+# Normal-type pod events that still stop or move a container
+POD_EVENT_REASONS = {"Killing", "Evicted", "Preempting", "OOMKilling", "Unhealthy", "BackOff"}
+# waits every pod start goes through
+POD_START_WAITS = {None, "PodInitializing", "ContainerCreating"}
+
+
+def status_samples(root):
+    """-> ([(time, deployment_resources_status_details)], source), oldest first.
+
+    pipeline_events.json samples the pod about once a minute; without it,
+    each snapshot's pipeline_config.json gives one sample.
+    """
+    events = pipeline_events(root)
+    if events:
+        return ([(str(e.get("recorded_at")), e.get("deployment_resources_status_details"))
+                 for e in events], "pipeline_events.json")
+    samples = []
+    for s in snapshots(root):
+        cfg = load_json(os.path.join(s, "pipeline_config.json")) or {}
+        if cfg.get("deployment_resources_status_details"):
+            samples.append((os.path.basename(s), cfg["deployment_resources_status_details"]))
+    return samples, "pipeline_config.json"
+
+
+def pod_statuses(details):
+    """-> [(pod ordinal or None, pod status)] for every Kubernetes pod status in a blob.
+
+    The runner lists the pods of the statefulset in "pods" by ordinal, and keeps
+    a pod's slot when the pod is missing, so the index is the ordinal.
+    """
+    found = []
+
+    def walk(node, ordinal):
+        if isinstance(node, dict):
+            if "containerStatuses" in node or "initContainerStatuses" in node:
+                found.append((ordinal, node))
+                return
+            for k, v in node.items():
+                if k == "pods" and isinstance(v, list):
+                    for i, pod in enumerate(v):
+                        walk(pod, i)
+                else:
+                    walk(v, ordinal)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, ordinal)
+    walk(details, None)
+    return found
+
+
+# the runner names the pipeline container after its statefulset: pipeline-<pipeline id>
+PIPELINE_CONTAINER = re.compile(r"^pipeline-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def pod_containers(details):
+    """-> [(pod ordinal or None, name, container status)] in a status details blob.
+
+    name is "main" for the pipeline container, else the container's own name
+    (an init container, a native sidecar, or a second regular container such
+    as istio-proxy).
+    """
+    out = []
+    for ordinal, pod in pod_statuses(details):
+        for group in ("containerStatuses", "initContainerStatuses"):
+            members = [c for c in pod.get(group) or [] if isinstance(c, dict)]
+            for c in members:
+                name = c.get("name") or "?"
+                if group == "containerStatuses" and (PIPELINE_CONTAINER.match(name)
+                                                     or len(members) == 1):
+                    name = "main"
+                out.append((ordinal, name, c))
+    return out
+
+
+def container_who(ordinal, name, pods):
+    """The container name, prefixed with its pod when the pipeline runs more than one."""
+    return f"pod{ordinal}/{name}" if pods > 1 and ordinal is not None else name
+
+
+def last_termination(c):
+    """-> the container's newest terminated state, or None."""
+    for state in ("state", "lastState"):
+        t = (c.get(state) or {}).get("terminated")
+        if t:
+            return t
+    return None
+
+
+def pod_events(details):
+    """-> [(pod ordinal or None, parsed event)] for the Kubernetes pod event strings in a blob."""
+    found = []
+
+    def walk(node, ordinal):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "pods" and isinstance(v, list):
+                    for i, pod in enumerate(v):
+                        walk(pod, i)
+                else:
+                    walk(v, ordinal)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, ordinal)
+        elif isinstance(node, str) and node.startswith("["):
+            m = POD_EVENT.match(node)
+            if m:
+                found.append((ordinal, m.groupdict()))
+    walk(details, None)
+    return found
+
+
+def image_label(container):
+    """'repo:tag @digest12' with the registry path dropped."""
+    image = str(container.get("image") or "?").rsplit("/", 1)[-1]
+    m = re.search(r"sha256:([0-9a-f]{12})", str(container.get("imageID") or ""))
+    return f"{image} @{m.group(1)}" if m else image
+
+
+def mutable_tag(image):
+    """True when an image reference can resolve to a new image at the next pull."""
+    if "@sha256:" in image:
+        return False
+    name = image.rsplit("/", 1)[-1]
+    return ":" not in name or name.rsplit(":", 1)[1] == "latest"
+
+
+def section_sidecars(root, top):
+    print("== sidecars and pod containers ==")
+    samples, source = status_samples(root)
+    if not samples:
+        print("  no pod status in pipeline_events.json or pipeline_config.json")
+        return
+    print(f"  {len(samples)} pod status samples from {source}, {samples[0][0]} .. {samples[-1][0]}")
+
+    _, cfg = snapshot_config(root, None)
+    specs = {c["name"]: c for c in lookup(config_layers(cfg), None, "init_containers") or []
+             if isinstance(c, dict) and c.get("name")}
+    if specs:
+        print("  -- configured init and sidecar containers (init_containers) --")
+        print(f"  {'name':<20} {'kind':<8} {'probes':<26} {'memory limit':<13} image")
+        for name, c in specs.items():
+            kind = "sidecar" if c.get("restartPolicy") == "Always" else "init"
+            probes = ",".join(p for p in ("startup", "liveness", "readiness")
+                              if c.get(f"{p}Probe")) or "none"
+            limit = ((c.get("resources") or {}).get("limits") or {}).get("memory", "-")
+            print(f"  {name:<20} {kind:<8} {probes:<26} {limit:<13} {c.get('image')}")
+            if kind == "sidecar" and not c.get("livenessProbe"):
+                print(f"  >> {name}: no livenessProbe; Kubernetes keeps a hung sidecar ready and"
+                      " never restarts it, so readiness and restarts cannot show a hang")
+            if mutable_tag(str(c.get("image") or "")):
+                print(f"  >> {name}: mutable image tag; each pod start can pull a different"
+                      " image (watch the digest below)")
+
+    # walk the samples: image changes per pod start, and per-container events,
+    # each container keyed by its pod so the pods of a multi-host pipeline stay apart
+    pods = len({o for _, d in samples for o, _ in pod_statuses(d)})
+    timeline = set()  # (time, who, text)
+    images, waiting = {}, {}
+    was_ready, unready = set(), set()  # container ids that were ready / that lost it
+    image_sets = []  # (main, started, first seen, {who: label}, [whos that changed])
+    for when, details in samples:
+        by_pod = collections.defaultdict(list)
+        for ordinal, name, c in pod_containers(details):
+            by_pod[ordinal].append((container_who(ordinal, name, pods), c))
+        for ordinal, members in by_pod.items():
+            current = {}
+            for who, c in members:
+                cid = c.get("containerID")
+                if c.get("imageID"):  # a container still starting has no digest yet
+                    current[who] = c
+                for state in ("lastState", "state"):
+                    t = (c.get(state) or {}).get("terminated")
+                    if t and t.get("finishedAt"):
+                        timeline.add((t["finishedAt"], who,
+                                      f"terminated {t.get('reason')} (exit {t.get('exitCode')}),"
+                                      f" ran from {t.get('startedAt')}"))
+                w = ((c.get("state") or {}).get("waiting") or {}).get("reason")
+                if w not in POD_START_WAITS and waiting.get(who) != w:
+                    timeline.add((when, who, f"waiting: {w}"))
+                waiting[who] = w
+                # readiness lost by a running container, not the wait at its start
+                if c.get("ready"):
+                    if cid in unready:
+                        timeline.add((when, who, "ready again"))
+                        unready.discard(cid)
+                    was_ready.add(cid)
+                elif cid in was_ready and cid not in unready:
+                    timeline.add((when, who, "not ready (it was, and did not restart)"))
+                    unready.add(cid)
+            labels = {n: image_label(c) for n, c in current.items()}
+            changed = [n for n, lab in labels.items() if images.get(n) not in (None, lab)]
+            if labels and (not image_sets or changed or set(labels) - set(images)):
+                main = container_who(ordinal, "main", pods)
+                running = ((current.get(main) or {}).get("state") or {}).get("running") or {}
+                image_sets.append((main, running.get("startedAt"), when, labels, changed))
+            images.update(labels)
+        for ordinal, ev in pod_events(details):
+            if ev["type"] != "Normal" or ev["reason"] in POD_EVENT_REASONS:
+                timeline.add((ev["time"], container_who(ordinal, ev["source"], pods),
+                              f"{ev['type']} {ev['reason']}: {ev['message'][:140]}"))
+
+    print("  -- container images, at the first sample and at every change --")
+    for main, started, when, labels, changed in image_sets:
+        print(f"  {main} started {started or '?'} (first seen {when[:19]})")
+        for who, lab in labels.items():
+            mark = "  << changed" if who in changed else ""
+            print(f"     {who[:24]:<24} {lab}{mark}")
+        if len(changed) > 1:
+            print(f"  >> {', '.join(changed)} changed image on the same pod start; either change"
+                  " can explain what follows, so do not credit one without ruling out the other")
+
+    print("  -- container and pod events (terminations, readiness, waits, kills, warnings) --")
+    rows = sorted(timeline)
+    limit = max(3 * top, 30)
+    if len(rows) > limit:
+        print(f"  ({len(rows) - limit} earlier events not shown; raise --top)")
+    for when, who, text in rows[-limit:]:
+        print(f"  {when[:19]:<19} {who[:24]:<24} {text}")
+    if not rows:
+        print("  none")
+
+
+# --------------------------------------------------------------------------
+# section: inputs -- connector buffer limits against the budget, and errors
+# --------------------------------------------------------------------------
+DEFAULT_MAX_QUEUED_RECORDS = 1_000_000  # feldera-types default_max_queued_records
+QUEUED_BYTES_PER_RECORD = 1000  # an unset byte limit is 1000 x max_queued_records
+QUEUED_BYTES_VERSION = (0, 305, 0)  # first release with a byte limit
+MAX_QUEUED_SIZE = Setting(None, "max_queued_size", "max_queued_bytes", 1, "size")
+
+
+def input_connectors(cfg):
+    """-> {endpoint: connector config}: the SQL connectors plus any added by the API."""
+    cfg = cfg or {}
+    out = dict((cfg.get("program_info") or {}).get("input_connectors") or {})
+    out.update(lookup(config_layers(cfg), None, "inputs") or {})
+    return {k: v for k, v in out.items() if isinstance(v, dict)}
+
+
+def queue_limits(conn, version):
+    """-> (records, bytes or None, records set?, bytes set?) that pause this connector."""
+    records = whole_number(conn.get("max_queued_records"))
+    found = read_setting([conn], MAX_QUEUED_SIZE)
+    size = found.value if found else None
+    limit = DEFAULT_MAX_QUEUED_RECORDS if records is None else records  # 0 is a real limit
+    if size is None and (version is None or version >= QUEUED_BYTES_VERSION):
+        size = limit * QUEUED_BYTES_PER_RECORD
+    return limit, size, records is not None, found is not None
+
+
+def error_shape(message):
+    message = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27}", "<uuid>", str(message))
+    return re.sub(r"\d+", "<n>", message).strip()
+
+
+def section_inputs(root, top):
+    print("== inputs: buffer limits against the budget, and errors ==")
+    snap, cfg = snapshot_config(root, None)
+    if not cfg:
+        print("  no pipeline_config.json in any snapshot")
+        return
+    conns = input_connectors(cfg)
+    print(f"  from {os.path.basename(snap)}/pipeline_config.json")
+    if not conns:
+        print("  no input connectors in program_info or the runtime config")
+        return
+    transports = collections.Counter((c.get("transport") or {}).get("name") for c in conns.values())
+    tables = collections.Counter(c.get("stream") for c in conns.values())
+    pre = collections.Counter(p.get("name") for c in conns.values()
+                              for p in c.get("preprocessor") or [] if isinstance(p, dict))
+    print(f"  {'connectors':<18} {len(conns)}: "
+          + ", ".join(f"{t} {n}" for t, n in transports.most_common()))
+    print(f"  {'per table':<18} " + ", ".join(f"{t} {n}" for t, n in tables.most_common(top)))
+    if pre:
+        print(f"  {'preprocessors':<18} " + ", ".join(f"{p} on {n}" for p, n in pre.most_common())
+              + "; a preprocessor failure counts as a parse error, and that message is dropped")
+
+    # Feldera pauses a connector when its own buffer is full; nothing caps the sum
+    version = version_tuple(cfg)
+    size_name = next((read_setting([c], MAX_QUEUED_SIZE).key for c in conns.values()
+                      if read_setting([c], MAX_QUEUED_SIZE)), None) \
+        or (MAX_QUEUED_SIZE.current if version and version >= SIZE_RENAME_VERSION
+            else MAX_QUEUED_SIZE.legacy)
+    groups = collections.Counter(queue_limits(c, version) for c in conns.values())
+    print("  -- buffer limits (each connector pauses only when its own buffer is full) --")
+    for (records, size, rec_set, size_set), n in groups.most_common():
+        print(f"  {n:>4} connectors  max_queued_records {records:,}"
+              f"{'' if rec_set else ' (default)'}  {size_name} "
+              + ("none in this version" if size is None
+                 else fmt_bytes(size) + ("" if size_set else
+                                         f" (default: {QUEUED_BYTES_PER_RECORD} x records)")))
+    sum_records = sum(r * n for (r, _s, _a, _b), n in groups.items())
+    sizes = [s * n for (_r, s, _a, _b), n in groups.items() if s is not None]
+    print(f"  {'sum of limits':<18} {sum_records:,} records"
+          + (f", {fmt_bytes(sum(sizes))}" if sizes else ""))
+    layers = config_layers(cfg)
+    for s in (MEMORY_MAX, MAX_RSS):
+        budget = read_setting(layers, s)
+        if sizes and budget and budget.value:
+            share = 100.0 * sum(sizes) / budget.value
+            print(f"  {'vs ' + budget.key:<18} {fmt_bytes(sum(sizes))} / {fmt_bytes(budget.value)}"
+                  f" = {share:.0f}%")
+            if share >= 100 and s is MEMORY_MAX:
+                print(f"  >> the connectors may together buffer {share / 100:.1f}x {budget.key}"
+                      " before any one of them pauses")
+
+    print("  -- buffered and errors per snapshot (stats.json; counters reset at each restart) --")
+    print(f"  {'snapshot':<34} {'buffered':>12} {'bytes':>9} {'of mem':>7} "
+          f"{'parse err':>10} {'transport':>10} {'records in':>14}")
+    worst, shapes, fatal = None, {}, collections.Counter()
+    for s in snapshots(root):
+        st = load_json(os.path.join(s, "stats.json"))
+        if not st or not isinstance(st.get("inputs"), list):
+            continue
+        inputs = st["inputs"]
+
+        def total(key):
+            return sum((i.get("metrics") or {}).get(key) or 0 for i in inputs)
+        _, scfg = snapshot_config(root, s)
+        budget = read_setting(config_layers(scfg), MEMORY_MAX)
+        share = (f"{100.0 * total('buffered_bytes') / budget.value:.1f}%"
+                 if budget and budget.value else "-")
+        print(f"  {os.path.basename(s):<34} {total('buffered_records'):>12,} "
+              f"{fmt_bytes(total('buffered_bytes')):>9} {share:>7} {total('num_parse_errors'):>10,} "
+              f"{total('num_transport_errors'):>10,} {total('total_records'):>14,}")
+        if total("num_parse_errors") + total("num_transport_errors"):
+            worst = (s, inputs)
+        for i in inputs:
+            if i.get("fatal_error"):
+                fatal[f"{i.get('endpoint_name')}: {str(i['fatal_error'])[:150]}"] += 1
+            for kind in ("parse_errors", "transport_errors"):
+                for e in i.get(kind) or []:
+                    if isinstance(e, dict):
+                        key = (i.get("endpoint_name"), e.get("timestamp"), e.get("message"))
+                        shapes[key] = (kind, error_shape(e.get("message")), str(e.get("timestamp")))
+
+    if worst:
+        s, inputs = worst
+        print(f"  -- connectors with the most errors ({os.path.basename(s)}) --")
+        ranked = sorted(inputs, key=lambda i: -((i.get("metrics") or {}).get("num_parse_errors", 0)
+                                                + (i.get("metrics") or {}).get("num_transport_errors", 0)))
+        for i in ranked[:top]:
+            m = i.get("metrics") or {}
+            errs = m.get("num_parse_errors", 0) + m.get("num_transport_errors", 0)
+            if not errs:
+                break
+            print(f"  {str(i.get('endpoint_name'))[:60]:<60} parse={m.get('num_parse_errors', 0):,}"
+                  f" transport={m.get('num_transport_errors', 0):,}"
+                  f" ({100.0 * errs / max(m.get('total_records') or 0, 1):.2f}% of its records)")
+    if shapes:
+        print("  -- recent error messages (stats.json keeps the last few per connector), folded --")
+        folded = {}
+        for kind, shape, when in shapes.values():
+            n, first, last = folded.get((kind, shape), (0, when, when))
+            folded[(kind, shape)] = (n + 1, min(first, when), max(last, when))
+        for (kind, shape), (n, first, last) in sorted(folded.items(), key=lambda x: -x[1][0])[:top]:
+            print(f"  [{n}] {kind:<16} {first[:19]} .. {last[:19]}  {shape[:150]}")
+    for text, n in fatal.most_common(top):
+        print(f"  >> fatal [{n} snapshot(s)] {text}")
+
+    changes, last = [], object()
+    for e in pipeline_events(root):
+        # some platform versions write an error text here, not an object
+        det = e.get("deployment_runtime_status_details")
+        stats = det.get("connector_stats") if isinstance(det, dict) else None
+        n = stats.get("num_errors") if isinstance(stats, dict) else None
+        if n is not None and n != last:
+            changes.append((str(e.get("recorded_at")), n))
+            last = n
+    if changes:
+        print("  -- connector error count over time (pipeline_events.json; resets at restart) --")
+        limit = max(2 * top, 20)
+        if len(changes) > limit:
+            print(f"  ({len(changes) - limit} earlier changes not shown; raise --top)")
+        for when, n in changes[-limit:]:
+            print(f"  {when[:19]:<20} {n:,}")
 
 
 # --------------------------------------------------------------------------
@@ -604,49 +1033,72 @@ def node_metric(prof, metric_id):
     return out
 
 
+VIEW_DEF = re.compile(r'^\s*CREATE\s+(?:MATERIALIZED\s+|LOCAL\s+)?VIEW\s+"?([^"\s(]+)', re.I)
+
+
 class MirIndex:
     """Maps a circuit-profile persistent_id hash to its SQL provenance.
 
     Chain: circuit_profile node -> persistent_id "<hash>[.role]"
         -> dataflow_graph.json mir node -> table / view / operation / SQL line.
+    Operators of a recursive view are children of a MIR node whose operation
+    is "nested". They name no table or view, so the view is the CREATE VIEW
+    statement above their SQL line.
     """
 
-    def __init__(self, root):
+    def __init__(self, root, snap=None):
+        """Read the MIR and SQL of snap, else of the newest snapshot of root that has them."""
         self.by_hash = {}
         self.sql_lines = []
-        snaps = snapshots(root)
-        for s in reversed(snaps):
+        order = ([snap] if snap else []) + (list(reversed(snapshots(root))) if root else [])
+        for s in order:
             dg = load_json(os.path.join(s, "dataflow_graph.json"))
             if dg and isinstance(dg.get("mir"), dict):
+                nested = []
                 for mid, node in dg["mir"].items():
-                    h = node.get("persistent_id")
-                    if h:
-                        self.by_hash[h] = (mid, node)
+                    if node.get("persistent_id"):
+                        self.by_hash[node["persistent_id"]] = (mid, node)
+                    if node.get("operation") == "nested":
+                        nested += [(cid, c) for cid, c in node.items()
+                                   if isinstance(c, dict) and c.get("persistent_id")]
+                for cid, child in nested:
+                    self.by_hash.setdefault(child["persistent_id"], (cid, child))
                 break
-        for s in reversed(snaps):
+        for s in order:
             cfg = load_json(os.path.join(s, "pipeline_config.json"))
             if cfg and cfg.get("program_code"):
                 self.sql_lines = cfg["program_code"].splitlines()
                 break
 
     def resolve(self, persistent_id):
-        """-> (label, mir_id, node) with the role suffix stripped off the hash."""
-        if not persistent_id:
-            return None, None, None
-        h = persistent_id.split(".", 1)[0]
-        role = persistent_id.split(".", 1)[1] if "." in persistent_id else ""
+        """-> (label, mir_id, node) with the role suffix stripped off the hash.
+
+        All None when the MIR has no entry; the caller falls back to the DBSP label.
+        """
+        h, _, role = (persistent_id or "").partition(".")
         hit = self.by_hash.get(h)
         if not hit:
-            return (f"{h[:12]}..{('.' + role) if role else ''}", None, None)
+            return None, None, None
         mid, node = hit
-        what = node.get("table") or node.get("view") or "-"
-        op = node.get("operation") or "?"
-        pos = (node.get("positions") or [{}])[0]
-        line = pos.get("start_line_number")
-        label = f"{what} [{op}]" + (f" sql:{line}" if line else "")
+        line = ((node.get("positions") or [{}])[0]).get("start_line_number")
+        what = node.get("table") or node.get("view") or (line and self.owning_view(line)) or "-"
+        label = f"{what} [{node.get('operation') or '?'}]" + (f" sql:{line}" if line else "")
         if role:
             label += f" .{role}"
         return label, mid, node
+
+    def line_of(self, persistent_id):
+        """-> the SQL line that created the operator, or None."""
+        _label, _mid, node = self.resolve(persistent_id)
+        return ((node or {}).get("positions") or [{}])[0].get("start_line_number")
+
+    def owning_view(self, line):
+        """-> the view whose CREATE VIEW statement is the last one at or above line."""
+        for i in range(min(line, len(self.sql_lines)) - 1, -1, -1):
+            m = VIEW_DEF.match(self.sql_lines[i])
+            if m:
+                return m.group(1)
+        return None
 
     def sql_at(self, line, context=0):
         if not (self.sql_lines and line):
@@ -676,12 +1128,8 @@ def node_labels(prof, mir=None):
     dbsp = simple_nodes(prof)
     if not mir:
         return {n: raw.get(n) or dbsp.get(n, "") for n in set(raw) | set(dbsp)}
-    out = {}
-    for n in set(raw) | set(dbsp):
-        pid = raw.get(n)
-        label = mir.resolve(pid)[0] if pid else None
-        out[n] = label or dbsp.get(n, "") or (pid or "")
-    return out
+    return {n: mir.resolve(raw.get(n))[0] or dbsp.get(n, "") or raw.get(n, "")
+            for n in set(raw) | set(dbsp)}
 
 
 def catalog(prof):
@@ -697,7 +1145,7 @@ def section_time(root, top):
         print("== time ==\n  no circuit_profile.json[.gz] in any snapshot")
         return
     print(f"== time: hot operators (from {os.path.basename(snap)}) ==")
-    lab = node_labels(prof, MirIndex(root))
+    lab = node_labels(prof, MirIndex(root, snap))
     rt = node_metric(prof, "runtime_seconds")
     total = sum(sum(v) for v in rt.values()) or 1.0
     ranked = sorted(rt.items(), key=lambda kv: -sum(kv[1]))
@@ -726,7 +1174,7 @@ def section_skew(root, top):
     nworkers = len(prof.get("worker_profiles", []))
     print(f"== skew across {nworkers} workers (from {os.path.basename(snap)}) ==")
     print("  ratio = max/mean. 1.0 is perfect balance; N means one worker does N x its share.")
-    lab = node_labels(prof, MirIndex(root))
+    lab = node_labels(prof, MirIndex(root, snap))
 
     # 1. key_distribution is an explicit per-worker histogram
     print("  -- key_distribution (balancer) --")
@@ -795,21 +1243,33 @@ def section_skew(root, top):
 # --------------------------------------------------------------------------
 # section: sql -- amplification and wasted work
 # --------------------------------------------------------------------------
+def truncates(bounds):
+    """True when a retainment_bounds measurement lets the trace drop records.
+
+    Feldera writes {"key": [...], "value": [...]} (TraceBoundsInner::metadata
+    in dbsp's operator/dynamic/trace.rs). Each list holds the Debug text of
+    Option bounds and the lowest one applies, so one "None" (no bound, or no
+    waterline yet) keeps every record. A side that is a retain filter, not a
+    list, drops records.
+    """
+    if not (isinstance(bounds, dict) and "key" in bounds and "value" in bounds):
+        return bounds not in (None, [], {})  # an older shape: any content is a bound
+
+    def side(pred):
+        if not isinstance(pred, list):
+            return True
+        texts = [p.get("value") if isinstance(p, dict) else p for p in pred]
+        return bool(texts) and "None" not in texts
+    return side(bounds["key"]) or side(bounds["value"])
+
+
 def section_sql(root, top):
     snap, prof = newest_profile(root)
     if not prof:
         print("== sql ==\n  no circuit_profile.json[.gz] in any snapshot")
         return
     print(f"== sql efficiency (from {os.path.basename(snap)}) ==")
-    _, mpath = newest_metrics(root)
-    if mpath:
-        g = prom_gauges(mpath, ["transaction_state", "dbsp_steps_total"])
-        if g.get("transaction_state") and (g.get("dbsp_steps_total", 0) or 0) <= 1:
-            print("  NOTE profile captured with a transaction still open and <=1 step done.")
-            print("       Join/output metrics are zero because that work happens at commit.")
-            print("       Re-collect a bundle mid-commit to size joins.")
-    mir = MirIndex(root)
-    lab = node_labels(prof, mir)
+    lab = node_labels(prof, MirIndex(root, snap))
 
     def total(mid):
         return {k: sum(v) for k, v in node_metric(prof, mid).items()}
@@ -830,6 +1290,12 @@ def section_sql(root, top):
               f"  {lab.get(node,'')[:70]}")
     if not rows:
         print("     no join operators produced output in this profile")
+        _, mpath = snapshot_metrics(root, snap)
+        txn_open, done = transactions(mpath) if mpath else (False, 0)
+        if txn_open and done <= 1:
+            print("  NOTE profile captured with a transaction still open and <=1 step done.")
+            print("       Join/output metrics are zero because that work happens at commit.")
+            print("       Re-collect a bundle mid-commit to size joins.")
 
     print("  -- output_redundancy_percent (work discarded downstream) --")
     red = node_metric(prof, "output_redundancy_percent")
@@ -853,14 +1319,159 @@ def section_sql(root, top):
     for w in prof.get("worker_profiles", []):
         for node, ms in (w.get("metadata") or {}).items():
             for m in ms:
-                if m.get("metric_id") == "retainment_bounds":
-                    v = m.get("value")
-                    if v not in (None, [], {}):
-                        bounded.add(node)
+                if m.get("metric_id") == "retainment_bounds" and truncates(m.get("value")):
+                    bounded.add(node)
     unb = [(v, n) for n, v in st.items() if v > 0 and n not in bounded]
     print("  -- largest state with no retainment bound (candidates for LATENESS / windowing) --")
     for v, node in sorted(unb, reverse=True)[:top]:
         print(f"  {node:<10} {v:>18,.0f} records  {lab.get(node,'')[:70]}")
+
+
+# --------------------------------------------------------------------------
+# section: materialized -- stored views that no output connector reads
+# --------------------------------------------------------------------------
+def relation_key(name):
+    """One spelling for a table or view: quotes off, case folded."""
+    return (name or "").strip('"').lower()
+
+
+def newest_with(root, name, key, prefer=None):
+    """-> (snapshot, artifact) for prefer, else the newest snapshot, whose artifact has key."""
+    for s in ([prefer] if prefer else []) + list(reversed(snapshots(root))):
+        doc = load_json(os.path.join(s, name))
+        if isinstance(doc, dict) and doc.get(key):
+            return s, doc
+    return None, None
+
+
+def materialized_views(cfg):
+    """-> ({view: has output connector}, source) for every MATERIALIZED view.
+
+    program_info (compiled schema) is exact. Without it, fall back to the SQL:
+    a connector is declared in the WITH clause before the view's AS.
+    """
+    info = cfg.get("program_info") or {}
+    outputs = (info.get("schema") or {}).get("outputs")
+    if outputs is not None:
+        fed = {relation_key(c.get("stream")) for c in (info.get("output_connectors") or {}).values()}
+        return ({relation_key(o.get("name")): relation_key(o.get("name")) in fed
+                 for o in outputs if o.get("materialized")}, "program_info")
+    out = {}
+    for stmt in (cfg.get("program_code") or "").split(";"):
+        m = re.match(r'\s*CREATE\s+MATERIALIZED\s+VIEW\s+"?(\w+)"?', stmt, re.I)
+        if m:
+            head = re.split(r"\sAS\s", stmt, maxsplit=1, flags=re.I)[0]
+            out[relation_key(m.group(1))] = "'connectors'" in head
+    return out, "program_code"
+
+
+def view_readers(dataflow):
+    """-> {relation: {views that scan it}} from the Calcite plan."""
+    readers = collections.defaultdict(set)
+    for view, plan in ((dataflow or {}).get("calcite_plan") or {}).items():
+        for rel in (plan or {}).get("rels") or []:
+            if rel.get("relOp") == "LogicalTableScan" and rel.get("table"):
+                readers[relation_key(rel["table"][-1])].add(relation_key(view))
+    return readers
+
+
+def materialized_state(prof, dataflow):
+    """-> {view: (records, disk bytes, memory bytes)} of the copy MATERIALIZED keeps.
+
+    The copy feeds an Output node whose persistent_id is
+    "<hash of the view's MIR inspect node>.integral". The records live in the
+    Z1 (trace) next to the AccumulateUntimedTraceAppend upstream of that Output.
+    """
+    inspect = {}
+    for node in ((dataflow or {}).get("mir") or {}).values():
+        if node.get("operation") == "inspect" and node.get("view") and node.get("persistent_id"):
+            inspect[node["persistent_id"]] = relation_key(node["view"])
+    leaves = simple_nodes(prof)
+    pids = {}
+    for node, ms in ((prof.get("worker_profiles") or [{}])[0].get("metadata") or {}).items():
+        for m in ms:
+            if m.get("metric_id") == "persistent_id":
+                pids[node] = (m.get("value") or {}).get("value") or ""
+    ups, downs = collections.defaultdict(list), collections.defaultdict(list)
+    for e in (prof.get("graph") or {}).get("edges") or []:
+        ups[e.get("to_node")].append(e.get("from_node"))
+        downs[e.get("from_node")].append(e.get("to_node"))
+    metrics = {mid: {n: sum(v) for n, v in node_metric(prof, mid).items()}
+               for mid in ("state_records_count", "spine_storage_size_bytes", "used_memory_bytes")}
+    out = {}
+    for node, pid in pids.items():
+        view = inspect.get(pid.split(".", 1)[0])
+        if not view or not pid.endswith(".integral") or leaves.get(node) != "Output":
+            continue
+        near, frontier = set(), [node]
+        for _ in range(3):  # Output <- Apply <- AccumulateUntimedTraceAppend
+            frontier = [u for f in frontier for u in ups[f]]
+            near.update(frontier)
+        traces = {d for n in near if leaves.get(n, "").startswith("AccumulateUntimedTraceAppend")
+                  for d in downs[n] if leaves.get(d) == "Z1 (trace)"}
+        out[view] = tuple(sum(metrics[mid].get(t, 0) for t in traces) for mid in metrics)
+    return out
+
+
+def section_materialized(root, top):
+    snap, cfg = newest_with(root, "pipeline_config.json", "program_code")
+    if not cfg:
+        print("== materialized ==\n  no pipeline_config.json with program_code in any snapshot")
+        return
+    views, source = materialized_views(cfg)
+    lonely = sorted(v for v, fed in views.items() if not fed)
+    print(f"== materialized views with no output connector (from {os.path.basename(snap)}, {source}) ==")
+    print(f"  {len(views)} materialized views; {len(views) - len(lonely)} feed an output connector; "
+          f"{len(lonely)} do not")
+    if not lonely:
+        return
+    # the MIR, stats and budget of the run that the profile describes
+    psnap, prof = newest_profile(root)
+    _, dataflow = newest_with(root, "dataflow_graph.json", "mir", prefer=psnap)
+    readers = view_readers(dataflow)
+    state = materialized_state(prof, dataflow) if prof and dataflow else {}
+    _, stats = newest_with(root, "stats.json", "global_metrics", prefer=psnap)
+    http = collections.Counter(relation_key((o.get("config") or {}).get("stream"))
+                               for o in (stats or {}).get("outputs") or []
+                               if ".api-" in (o.get("endpoint_name") or ""))
+    # the profile's own spine total: stats.json storage_bytes counts the files differently
+    # (fine-grained-auth: 12.8MB of spines, 4.2MB of storage_bytes), so shares of it pass 100%
+    storage = sum(sum(v) for v in node_metric(prof, "spine_storage_size_bytes").values()) if prof else 0
+    budget = read_setting(config_layers(snapshot_config(root, psnap)[1]), MEMORY_MAX)
+    lines = {}
+    for i, text in enumerate(cfg["program_code"].splitlines(), 1):
+        m = re.match(r'\s*CREATE\s+MATERIALIZED\s+VIEW\s+"?(\w+)"?', text, re.I)
+        if m:
+            lines[relation_key(m.group(1))] = i
+
+    # a copy costs RAM until it spills, so rank by memory and disk together
+    rows = sorted(lonely, key=lambda v: -sum((state.get(v) or (0, 0, 0))[1:]))
+    print(f"  {'view':<48} {'sql':>5} {'records':>12} {'in memory':>9} {'on disk':>9} {'of disk':>8}"
+          f" {'http':>5}  read by views")
+    for v in rows[:top]:
+        rec, disk, mem = state.get(v) or (None, None, None)
+        share = f"{100 * disk / storage:.1f}%" if disk is not None and storage else "n/a"
+        recs = f"{rec:,.0f}" if rec is not None else "n/a"
+        size = fmt_bytes(disk) if disk is not None else "n/a"
+        ram = fmt_bytes(mem) if mem is not None else "n/a"
+        names = sorted(readers.get(v, ()))
+        shown = ", ".join(names[:2]) + (f" +{len(names) - 2}" if len(names) > 2 else "")
+        print(f"  {v[:48]:<48} {lines.get(v, ''):>5} {recs:>12} {ram:>9} {size:>9} {share:>8}"
+              f" {http.get(v, 0):>5}  {len(names)}: {shown or '-'}")
+    if len(rows) > top:
+        print(f"  ... {len(rows) - top} more (--top)")
+    known = [state[v] for v in lonely if v in state]
+    if known:
+        disk, mem = sum(s[1] for s in known), sum(s[2] for s in known)
+        print(f"  stored copies: {sum(s[0] for s in known):,.0f} records, {fmt_bytes(mem)} in memory"
+              + (f" ({100 * mem / budget.value:.1f}% of {budget.key})" if budget and budget.value else "")
+              + f", {fmt_bytes(disk)} on disk"
+              + (f" ({100 * disk / storage:.1f}% of all spine storage)" if storage else ""))
+    print("  ASK for each view: who needs its stored copy? MATERIALIZED serves ad-hoc SELECT")
+    print("  queries, send_snapshot (on a connector or an HTTP egress request) and debugging.")
+    print("  Being read by another view does not need it. http > 0 means clients stream it over")
+    print("  HTTP egress, which needs the copy only with send_snapshot=true. If nothing needs it,")
+    print("  CREATE VIEW keeps it streamable; CREATE LOCAL VIEW also drops it as an output.")
 
 
 # --------------------------------------------------------------------------
@@ -953,7 +1564,7 @@ def section_memory(root, top):
             print(f"  {mid:<28} {fmt_bytes(t):>10}  {share(t, 'disk')}")
 
     used = {k: sum(v) for k, v in node_metric(prof, "used_memory_bytes").items()}
-    lab = node_labels(prof, MirIndex(root))
+    lab = node_labels(prof, MirIndex(root, snap))
     print("  -- heaviest operators by in-memory state --")
     for v, node in sorted(((v, k) for k, v in used.items()), reverse=True)[:top]:
         print(f"  {node:<10} {fmt_bytes(v):>10}  {share(v):<20} {lab.get(node,'')[:70]}")
@@ -968,13 +1579,17 @@ def section_memory(root, top):
         looks = hits + misses
         if not size and not looks:
             continue
-        rate = 100.0 * hits / looks if looks else 0.0
+        rate = 100.0 * hits / looks if looks else None
         per_hit = size / hits if hits else float("inf")
         verdict = ""
-        if size and rate < 1.0:
-            verdict = "  <= large and almost never hits: candidate to shrink or disable"
-        print(f"  {fam:<9} size={fmt_bytes(size):>9} {share(size)}  hit_rate={rate:>6.2f}%"
-              f"  bytes/hit={'inf' if per_hit == float('inf') else fmt_bytes(per_hit)}{verdict}")
+        if size and not looks:
+            verdict = "  <= no lookups yet: its hit rate is unknown"
+        elif size and rate < 1.0 and (not budget or size >= budget / 100):
+            # below 1% of the memory budget a useless filter costs too little to tune
+            verdict = "  <= almost never hits: candidate to shrink or disable"
+        print(f"  {fam:<9} size={fmt_bytes(size):>9} {share(size)}  hit_rate="
+              + (f"{rate:>6.2f}%" if rate is not None else f"{'n/a':>7}")
+              + f"  bytes/hit={'inf' if per_hit == float('inf') else fmt_bytes(per_hit)}{verdict}")
 
     # Filter sizing: are the filters bigger than the configured rate implies?
     rate = None
@@ -1037,10 +1652,13 @@ def section_memory(root, top):
 # --------------------------------------------------------------------------
 # section: disk -- histogram percentiles, cache hit rates, stalls
 # --------------------------------------------------------------------------
-def parse_prom_histograms(path):
-    """-> {family: {le: cumulative_count}} plus {family: (count, sum)}."""
-    buckets = collections.defaultdict(dict)
-    totals = {}
+@functools.lru_cache(maxsize=None)
+def prom_samples(path):
+    """-> ((name, {label: value}, value), ...) for every sample in metrics.txt.
+
+    A multi-host pipeline writes one series per host, labeled ordinal="<n>".
+    """
+    out = []
     with open(path, errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -1049,25 +1667,34 @@ def parse_prom_histograms(path):
             m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)$", line)
             if not m:
                 continue
-            name, labels, val = m.group(1), m.group(2) or "", m.group(3)
             try:
-                v = float(val)
+                v = float(m.group(3))
             except ValueError:
                 continue
-            if name.endswith("_bucket"):
-                le = re.search(r'le="([^"]*)"', labels)
-                if le:
-                    key = float("inf") if le.group(1) in ("inf", "+Inf") else float(le.group(1))
-                    fam = name[: -len("_bucket")]
-                    buckets[fam][key] = buckets[fam].get(key, 0) + v
-            elif name.endswith("_count"):
-                fam = name[: -len("_count")]
-                c, s = totals.get(fam, (0.0, 0.0))
-                totals[fam] = (c + v, s)
-            elif name.endswith("_sum"):
-                fam = name[: -len("_sum")]
-                c, s = totals.get(fam, (0.0, 0.0))
-                totals[fam] = (c, s + v)
+            out.append((m.group(1), dict(re.findall(r'(\w+)="([^"]*)"', m.group(2) or "")), v))
+    return tuple(out)
+
+
+def parse_prom_histograms(path):
+    """-> {family: {le: cumulative_count}} plus {family: (count, sum)}.
+
+    Buckets add up every series of every host. Count and sum are those of the
+    host with the largest sum: each host observes every step and commit, so
+    adding the hosts up would multiply the count by the host count.
+    """
+    buckets = collections.defaultdict(dict)
+    per_host = collections.defaultdict(dict)  # family -> host -> [count, sum]
+    for name, labels, v in prom_samples(path):
+        if name.endswith("_bucket"):
+            if "le" in labels:
+                key = float("inf") if labels["le"] in ("inf", "+Inf") else float(labels["le"])
+                fam = name[: -len("_bucket")]
+                buckets[fam][key] = buckets[fam].get(key, 0) + v
+        elif name.endswith(("_count", "_sum")):
+            fam, _, kind = name.rpartition("_")
+            per_host[fam].setdefault(labels.get("ordinal"), [0.0, 0.0])[kind == "sum"] += v
+    totals = {fam: tuple(max(hosts.values(), key=lambda cs: cs[1]))
+              for fam, hosts in per_host.items()}
     return buckets, totals
 
 
@@ -1089,18 +1716,18 @@ def quantile_bounds(bkt, q):
 
 
 def prom_gauges(path, names):
-    """-> {name: float} first sample per family, ignoring labels."""
+    """-> {name: {host: float}}, the first sample per host; host is the ordinal label or None."""
     out = {}
-    with open(path, errors="replace") as f:
-        text = f.read()
-    for n in names:
-        m = re.search(r"^%s(?:\{[^}]*\})?\s+(\S+)$" % re.escape(n), text, re.M)
-        if m:
-            try:
-                out[n] = float(m.group(1))
-            except ValueError:
-                pass
+    names = set(names)
+    for name, labels, v in prom_samples(path):
+        if name in names:
+            out.setdefault(name, {}).setdefault(labels.get("ordinal"), v)
     return out
+
+
+def hosts_max(gauges, name):
+    """-> the largest value of a gauge on any host, or None."""
+    return max(gauges[name].values()) if gauges.get(name) else None
 
 
 def newest_metrics(root):
@@ -1109,6 +1736,27 @@ def newest_metrics(root):
         if os.path.exists(p):
             return s, p
     return None, None
+
+
+def snapshot_metrics(root, snap):
+    """-> (snapshot, metrics.txt path): the one collected with snap, else the newest."""
+    if snap and os.path.exists(os.path.join(snap, "metrics.txt")):
+        return snap, os.path.join(snap, "metrics.txt")
+    return newest_metrics(root)
+
+
+def transactions(path):
+    """-> (transaction_state, highest on any host; nonzero while one is open, transactions done).
+
+    dbsp_steps_total counts transaction steps, but some versions leave it at
+    0 after many commits, so the commit count of transaction_commit_seconds
+    counts too.
+    """
+    g = prom_gauges(path, ["transaction_state", "dbsp_steps_total"])
+    _, totals = parse_prom_histograms(path)
+    done = max(hosts_max(g, "dbsp_steps_total") or 0,
+               totals.get("transaction_commit_seconds", (0.0, 0.0))[0])
+    return hosts_max(g, "transaction_state") or 0, done
 
 
 def section_heap(root, top):
@@ -1149,6 +1797,9 @@ def section_heap(root, top):
     tot = total(samples, idx)
     tname, tunit = types[idx]
     print(f"  {tname} total       {fmt_bytes(tot)}")
+    if tot <= 0:
+        print("  no bytes sampled yet: nothing to attribute")
+        return
 
     # Coverage: what share of the process the profile explains.
     st = load_json(os.path.join(os.path.dirname(path), "stats.json"))
@@ -1173,23 +1824,12 @@ def section_heap(root, top):
     print(f"  {'':9} {100.0*shown/tot:>6.2f}%  of profiled bytes shown above")
 
     # Attribute to SQL through the operator hash embedded in generated symbols.
-    mir = MirIndex(root)
+    mir = MirIndex(root, os.path.dirname(path))
     byh = by_operator_hash(samples, idx)
     if byh:
         print("  -- attributed to SQL via generated operator symbols --")
-        hash_index = {h[:16]: v for h, v in
-                      ((pid, node) for pid, node in mir.by_hash.items())}
-        rows = []
-        for h, v in byh.items():
-            node = hash_index.get(h)
-            if node:
-                what = node[1].get("table") or node[1].get("view") or "-"
-                op = node[1].get("operation") or "?"
-                line = (node[1].get("positions") or [{}])[0].get("start_line_number")
-                label = f"{what} [{op}]" + (f" sql:{line}" if line else "")
-            else:
-                label = f"{h} (no MIR match)"
-            rows.append((v, label))
+        full = {pid[:16]: pid for pid in mir.by_hash}
+        rows = [(v, mir.resolve(full.get(h))[0] or f"{h} (no MIR match)") for h, v in byh.items()]
         for v, label in sorted(rows, reverse=True)[:top]:
             if v / tot < 0.0005:
                 continue
@@ -1239,16 +1879,15 @@ def section_pace(root):
         print("  no metrics.txt in any snapshot")
         return
     print(f"  from {os.path.basename(snap)}/metrics.txt")
-    g = prom_gauges(path, [
-        "dbsp_steps_total", "dbsp_runtime_elapsed_seconds_total",
-        "transaction_state", "transaction_completed_operators",
-        "transaction_in_progress_operators", "transaction_remaining_operators",
-        "pipeline_start_time_seconds", "records_processed_total",
-        "records_input_total", "records_late_total",
-    ])
-    bkt, tot = parse_prom_histograms(path)
+    g = prom_gauges(path, ["dbsp_steps_total", "records_late_total"])
+    _, tot = parse_prom_histograms(path)
+    hosts = len(g.get("dbsp_steps_total") or {})
+    if hosts > 1:
+        print(f"  {hosts} hosts step together: step counts are per host; n and total"
+              " are of the slowest host")
 
-    steps = g.get("dbsp_steps_total", 0)
+    steps = hosts_max(g, "dbsp_steps_total") or 0
+    txn, done = transactions(path)  # done: also counts commits where dbsp_steps_total stays 0
     print(f"  dbsp_steps_total          {steps:,.0f}   (transaction-level steps)")
 
     # Wall clock and circuit step count must come from per-worker maxima.
@@ -1276,8 +1915,8 @@ def section_pace(root):
     if wall and circuit_steps:
         print(f"  seconds per circuit step  {wall/circuit_steps:,.3f}s "
               "(derived: wall clock / circuit steps)")
-    if steps and circuit_steps and steps < circuit_steps:
-        print(f"  NOTE {circuit_steps:,.0f} circuit steps map to {steps:,.0f} transaction step(s):"
+    if done and circuit_steps and done < circuit_steps:
+        print(f"  NOTE {circuit_steps:,.0f} circuit steps map to {done:,.0f} transaction step(s):"
               " results only become visible at commit")
     for fam in ("dbsp_step_latency_seconds", "transaction_ingest_seconds",
                 "transaction_commit_seconds", "feldera_checkpoint_runtime_seconds",
@@ -1286,15 +1925,16 @@ def section_pace(root):
         if c:
             print(f"  {fam:<34} n={c:>10,.0f} mean={s/c:>12.3f}s total={s:>12.1f}s")
 
-    txn = g.get("transaction_state")
     if txn:
         print(f"  transaction_state         {txn:.0f} (a transaction is open)")
-    if steps and steps <= 10:
-        print(f"  >> only {steps:,.0f} transaction step(s) recorded: this pipeline batches its")
+    # 0 done counts too: an open first transaction, or circuit steps with no commit yet
+    if done <= 10 and (txn or (circuit_steps or 0) > done):
+        print(f"  >> only {done:,.0f} transaction step(s) recorded: this pipeline batches its")
         print( "     work into transactions, so dbsp_step_latency thresholds do NOT describe")
         print( "     it. Judge it by transaction ingest/commit duration and wall clock.")
-    if g.get("records_late_total"):
-        print(f"  records_late_total        {g['records_late_total']:,.0f}"
+    late = sum((g.get("records_late_total") or {}).values())  # each host drops its own
+    if late:
+        print(f"  records_late_total        {late:,.0f}"
               " (arriving behind LATENESS: dropped from results)")
     # the interval of the run these metrics came from
     cfg_snap, cfg = snapshot_config(root, snap)
@@ -1310,25 +1950,32 @@ def section_pace(root):
         if c and s / c > ci:
             print(f"  >> mean checkpoint runtime ({s/c:,.1f}s) exceeds the interval ({ci:g}s):"
                   " checkpoints cannot keep their schedule")
-        if wall and steps and wall > ci and steps <= 1:
+        if wall and wall > ci and done <= 1 and (txn or done):
             print(f"  >> the open transaction has run {wall:,.0f}s against a {ci:g}s checkpoint"
                   " interval: no checkpoint can complete until it commits")
 
 
+DISK_GAUGES = ("compaction_stall_duration_seconds", "output_stall_seconds_total",
+               "storage_cache_usage_bytes", "storage_cache_usage_limit_bytes_total",
+               "storage_usage_bytes", "files_created_total", "files_deleted_total",
+               "memory_pressure", "memory_pressure_epoch", "max_rss_bytes",
+               "process_resident_memory_bytes", "process_swap_bytes",
+               "dbsp_steps_total", "records_late_total")
+
+
 def section_disk(root):
     print("== disk and cache ==")
-    snaps = snapshots(root)
-    path = None
-    for s in reversed(snaps):
-        p = os.path.join(s, "metrics.txt")
-        if os.path.exists(p):
-            path = p
-            break
+    snap, path = newest_metrics(root)
     if not path:
         print("  no metrics.txt in any snapshot")
     else:
-        print(f"  from {os.path.basename(os.path.dirname(path))}/metrics.txt")
+        print(f"  from {os.path.basename(snap)}/metrics.txt")
         bkt, tot = parse_prom_histograms(path)
+        g = prom_gauges(path, DISK_GAUGES)
+        hosts = max((len(v) for v in g.values()), default=1)
+        if hosts > 1:
+            print(f"  {hosts} hosts: count and mean are of the slowest host;"
+                  " the p50 / p99 buckets cover every host")
         fams = [f for f in bkt if f.startswith("storage_") or "checkpoint" in f
                 or f.startswith("dbsp_step_latency") or f.startswith("transaction_")]
         print(f"  {'family':<46} {'count':>12} {'mean':>12}   p50 / p99 bucket")
@@ -1347,34 +1994,38 @@ def section_disk(root):
             print(f"  {fam:<46} {c:>12,.0f} {mean:>11.4f}{unit or ' '}   "
                   f"{show(p50)} / {show(p99)}")
 
-        # derived saturation: usage against the pipeline's own configured limit
-        g = prom_gauges(path, ["storage_cache_usage_bytes",
-                               "storage_cache_usage_limit_bytes_total",
-                               "storage_usage_bytes", "process_resident_memory_bytes",
-                               "max_rss_bytes"])
-        cu, cl = g.get("storage_cache_usage_bytes"), g.get("storage_cache_usage_limit_bytes_total")
-        if cu and cl:
-            print(f"  cache saturation           {fmt_bytes(cu)} / {fmt_bytes(cl)} "
+        # derived saturation: usage against the pipeline's own configured limit,
+        # on the host nearest its limit
+        def nearest(used, limit):
+            pairs = [(h, u, (g.get(limit) or {}).get(h)) for h, u in (g.get(used) or {}).items()]
+            return max(((h, u, c) for h, u, c in pairs if u and c),
+                       key=lambda p: p[1] / p[2], default=None)
+
+        def on_host(text, h):
+            return f"{text} (host {h})" if hosts > 1 else text
+        hit = nearest("storage_cache_usage_bytes", "storage_cache_usage_limit_bytes_total")
+        if hit:
+            h, cu, cl = hit
+            print(f"  {on_host('cache saturation', h):<26} {fmt_bytes(cu)} / {fmt_bytes(cl)} "
                   f"= {100.0*cu/cl:.1f}% full")
             if cu / cl > 0.95:
                 print("     >> cache is effectively full: further reads must go to disk")
-        rss, cap = g.get("process_resident_memory_bytes"), g.get("max_rss_bytes")
-        if rss and cap:
-            print(f"  rss headroom               {fmt_bytes(rss)} / {fmt_bytes(cap)} "
+        hit = nearest("process_resident_memory_bytes", "max_rss_bytes")
+        if hit:
+            h, rss, cap = hit
+            print(f"  {on_host('rss headroom', h):<26} {fmt_bytes(rss)} / {fmt_bytes(cap)} "
                   f"= {100.0*rss/cap:.1f}% of the controller's own budget")
 
-        # gauges worth reading directly
-        with open(path, errors="replace") as f:
-            text = f.read()
-        for name in ("compaction_stall_duration_seconds", "output_stall_seconds_total",
-                     "storage_cache_usage_bytes", "storage_cache_usage_limit_bytes_total",
-                     "storage_usage_bytes", "files_created_total", "files_deleted_total",
-                     "memory_pressure", "memory_pressure_epoch", "max_rss_bytes",
-                     "process_resident_memory_bytes", "process_swap_bytes",
-                     "dbsp_steps_total", "records_late_total"):
-            for m in re.finditer(r"^%s(?:\{[^}]*\})?\s+(\S+)$" % re.escape(name), text, re.M):
-                print(f"  {name:<46} {m.group(1)}")
-                break
+        # gauges worth reading directly; a spread across hosts shows as min .. max
+        def num(v):
+            return f"{v:.15g}"  # as written: 106798.567806227, 263303412855
+        for name in DISK_GAUGES:
+            per = g.get(name)
+            if not per:
+                continue
+            lo, hi = min(per.values()), max(per.values())
+            print(f"  {name:<46} " + (num(hi) if lo == hi else
+                                      f"{num(lo)} .. {num(hi)} (max on host {max(per, key=per.get)})"))
 
     snap, prof = newest_profile(root)
     if prof:
@@ -1390,18 +2041,21 @@ def section_disk(root):
 SECTIONS = {
     "state": lambda a: section_state(a.bundle),
     "errors": lambda a: section_errors(a.bundle, a.top),
+    "sidecars": lambda a: section_sidecars(a.bundle, a.top),
+    "inputs": lambda a: section_inputs(a.bundle, a.top),
     "trend": lambda a: section_trend(a.bundle),
     "time": lambda a: section_time(a.bundle, a.top),
     "skew": lambda a: section_skew(a.bundle, a.top),
     "sql": lambda a: section_sql(a.bundle, a.top),
+    "materialized": lambda a: section_materialized(a.bundle, a.top),
     "memory": lambda a: section_memory(a.bundle, a.top),
     "heap": lambda a: section_heap(a.bundle, a.top),
     "types": lambda a: section_types(a.bundle),
     "pace": lambda a: section_pace(a.bundle),
     "disk": lambda a: section_disk(a.bundle),
 }
-ORDER = ["state", "errors", "trend", "pace", "time", "skew", "sql", "memory",
-         "heap", "disk", "types"]
+ORDER = ["state", "sidecars", "errors", "inputs", "trend", "pace", "time", "skew", "sql",
+         "materialized", "memory", "heap", "disk", "types"]
 
 
 def main():
@@ -1413,6 +2067,9 @@ def main():
     a = ap.parse_args()
     if not os.path.isdir(a.bundle):
         sys.exit(f"not a directory: {a.bundle}")
+    if not snapshots(a.bundle):
+        sys.exit(f"no snapshot directories (named by ISO timestamp) in {a.bundle}; read a flat"
+                 " bundle (<timestamp>_metrics.txt files) by hand")
     todo = ORDER if a.section == "all" else [a.section]
     for name in todo:
         SECTIONS[name](a)
