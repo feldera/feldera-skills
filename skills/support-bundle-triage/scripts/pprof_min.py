@@ -65,7 +65,8 @@ def parse_pprof(path):
     samples      = [(frozenset_of_function_names, [values...]), ...]
     Frames are ordered leaf-first, as pprof stores them.
     """
-    raw = gzip.open(path, "rb").read() if path.endswith(".gz") else open(path, "rb").read()
+    with (gzip.open if path.endswith(".gz") else open)(path, "rb") as f:
+        raw = f.read()
 
     strings = []
     functions = {}          # id -> name index
@@ -106,11 +107,12 @@ def parse_pprof(path):
         elif fn == 2:
             locs = []
             vals = []
+            # a repeated field can come packed (one or more runs) or one entry per field
             for sfn, w, v in _fields(payload):
                 if sfn == 1:
-                    locs = _packed_varints(v) if w == 2 else [v]
+                    locs += _packed_varints(v) if w == 2 else [v]
                 elif sfn == 2:
-                    vals = _packed_varints(v) if w == 2 else [v]
+                    vals += _packed_varints(v) if w == 2 else [v]
             raw_samples.append((locs, vals))
 
     def sname(i):
